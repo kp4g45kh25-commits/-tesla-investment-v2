@@ -1,997 +1,744 @@
-const app = document.querySelector("#app");
+import express from "express";
+import session from "express-session";
+import bcrypt from "bcryptjs";
+import Database from "better-sqlite3";
+import path from "path";
+import { fileURLToPath } from "url";
 
-const money = value =>
-  new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD"
-  }).format(Number(value || 0));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-const escapeHTML = value =>
-  String(value ?? "").replace(
-    /[&<>"']/g,
-    character =>
-      ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;"
-      })[character]
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+const db = new Database(
+  process.env.DATABASE_PATH || "tesla-investment.db"
+);
+
+db.pragma("journal_mode = WAL");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'client',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 
-async function api(url, options = {}) {
-  const response = await fetch(url, {
-    headers: {
-      "Content-Type": "application/json"
-    },
-    ...options
-  });
+  CREATE TABLE IF NOT EXISTS holdings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    name TEXT NOT NULL,
+    shares REAL NOT NULL,
+    price REAL NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
 
-  const data =
-    await response.json().catch(() => ({}));
+  CREATE TABLE IF NOT EXISTS requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    amount REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
 
-  if (!response.ok) {
-    throw new Error(
-      data.error || "Request failed."
-    );
+  CREATE TABLE IF NOT EXISTS transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    amount REAL NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+  );
+`);
+
+function seedDemoAccounts() {
+  const existing = db
+    .prepare("SELECT COUNT(*) AS count FROM users")
+    .get();
+
+  if (existing.count > 0) return;
+
+  const passwordHash = bcrypt.hashSync(
+    "demo123",
+    12
+  );
+
+  const insertUser = db.prepare(`
+    INSERT INTO users
+      (name, email, password_hash, role, status)
+    VALUES
+      (?, ?, ?, ?, ?)
+  `);
+
+  const client = insertUser.run(
+    "Demo Client",
+    "client@example.com",
+    passwordHash,
+    "client",
+    "active"
+  );
+
+  insertUser.run(
+    "Demo Manager",
+    "manager@example.com",
+    passwordHash,
+    "manager",
+    "active"
+  );
+
+  const clientId = client.lastInsertRowid;
+
+  db.prepare(`
+    INSERT INTO holdings
+      (user_id, symbol, name, shares, price)
+    VALUES
+      (?, ?, ?, ?, ?)
+  `).run(
+    clientId,
+    "TSLA",
+    "Tesla",
+    25,
+    342.50
+  );
+
+  db.prepare(`
+    INSERT INTO holdings
+      (user_id, symbol, name, shares, price)
+    VALUES
+      (?, ?, ?, ?, ?)
+  `).run(
+    clientId,
+    "CASH",
+    "Demo Cash",
+    1000,
+    1
+  );
+
+  db.prepare(`
+    INSERT INTO transactions
+      (user_id, type, amount, note)
+    VALUES
+      (?, ?, ?, ?)
+  `).run(
+    clientId,
+    "Demo allocation",
+    8562.50,
+    "Fictional portfolio record"
+  );
+
+  db.prepare(`
+    INSERT INTO notifications
+      (user_id, title, body)
+    VALUES
+      (?, ?, ?)
+  `).run(
+    clientId,
+    "Welcome",
+    "This is a demonstration account."
+  );
+
+  db.prepare(`
+    INSERT INTO documents
+      (user_id, title, category)
+    VALUES
+      (?, ?, ?)
+  `).run(
+    clientId,
+    "Demo Account Summary",
+    "Account"
+  );
+}
+
+seedDemoAccounts();
+
+app.use(express.json());
+
+app.use(
+  session({
+    secret:
+      process.env.SESSION_SECRET ||
+      "development-only-change-this-secret",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production"
+    }
+  })
+);
+
+app.use(
+  express.static(
+    path.join(__dirname, "public")
+  )
+);
+
+function currentUser(req) {
+  if (!req.session.userId) return null;
+
+  return db
+    .prepare(`
+      SELECT id, name, email, role, status
+      FROM users
+      WHERE id = ?
+    `)
+    .get(req.session.userId);
+}
+
+function requireLogin(req, res, next) {
+  const user = currentUser(req);
+
+  if (!user) {
+    return res
+      .status(401)
+      .json({ error: "Please sign in." });
   }
 
-  return data;
+  if (user.status !== "active") {
+    return res
+      .status(403)
+      .json({ error: "Account is not active." });
+  }
+
+  req.user = user;
+  next();
 }
 
-function page(title, body) {
-  app.innerHTML = `
-    <section class="wrap">
+function requireManager(req, res, next) {
+  if (req.user?.role !== "manager") {
+    return res
+      .status(403)
+      .json({ error: "Manager access required." });
+  }
 
-      <div class="heading">
-        <div>
-          <small>TESLA INVESTMENT</small>
-          <h1>${title}</h1>
-        </div>
-
-        <button
-          class="light"
-          onclick="logout()"
-        >
-          Log out
-        </button>
-      </div>
-
-      ${body}
-
-    </section>
-  `;
+  next();
 }
 
-function message(text, type = "") {
-  const element =
-    document.querySelector("#message");
-
-  if (!element) return;
-
-  element.textContent = text;
-  element.className = `message ${type}`;
-}
-
-function home() {
-  app.innerHTML = `
-    <section class="wrap hero">
-
-      <div>
-
-        <span class="pill">
-          INDEPENDENT PLATFORM PROTOTYPE
-        </span>
-
-        <h1>
-          Investment management,
-          redesigned for clarity.
-        </h1>
-
-        <p>
-          Tesla Investment is a modern demonstration
-          of client accounts, portfolio views and
-          manager workflows.
-        </p>
-
-        <button onclick="login()">
-          Sign in
-        </button>
-
-        <button
-          class="light"
-          onclick="register()"
-        >
-          Create account
-        </button>
-
-      </div>
-
-      <div class="heroCard">
-
-        <b>TI</b>
-
-        <small>PORTFOLIO DEMO</small>
-
-        <h2>
-          Simple. Focused. Transparent.
-        </h2>
-
-        <p>
-          Fictional portfolio data for
-          software demonstration.
-        </p>
-
-        <strong>$8,562.50</strong>
-
-      </div>
-
-    </section>
-
-    <section class="features">
-
-      <article>
-        <b>01</b>
-        <h3>Client accounts</h3>
-        <p>
-          Registration and secure password
-          authentication.
-        </p>
-      </article>
-
-      <article>
-        <b>02</b>
-        <h3>Portfolio dashboard</h3>
-        <p>
-          Fictional holdings, transactions
-          and account requests.
-        </p>
-      </article>
-
-      <article>
-        <b>03</b>
-        <h3>Manager console</h3>
-        <p>
-          Review clients and demo
-          workflow requests.
-        </p>
-      </article>
-
-    </section>
-  `;
-}
-
-function login() {
-  page(
-    "Sign in",
-    `
-    <div class="card auth">
-
-      <small>SECURE DEMO ACCESS</small>
-
-      <h2>Welcome back</h2>
-
-      <div id="message"></div>
-
-      <form onsubmit="doLogin(event)">
-
-        <label>
-          Email
-          <input
-            id="loginEmail"
-            type="email"
-            required
-          >
-        </label>
-
-        <label>
-          Password
-          <input
-            id="loginPassword"
-            type="password"
-            required
-          >
-        </label>
-
-        <button>
-          Continue
-        </button>
-
-      </form>
-
-      <div class="demo">
-
-        <b>Demo accounts</b>
-
-        <p>
-          Client:
-          client@example.com /
-          demo123
-        </p>
-
-        <p>
-          Manager:
-          manager@example.com /
-          demo123
-        </p>
-
-      </div>
-
-    </div>
-    `
-  );
-}
-
-async function doLogin(event) {
-  event.preventDefault();
-
+app.post("/api/register", async (req, res) => {
   try {
-    const data = await api(
-      "/api/login",
-      {
-        method: "POST",
-        body: JSON.stringify({
-          email:
-            document.querySelector(
-              "#loginEmail"
-            ).value,
+    const {
+      name,
+      email,
+      password
+    } = req.body || {};
 
-          password:
-            document.querySelector(
-              "#loginPassword"
-            ).value
-        })
-      }
-    );
-
-    if (data.role === "manager") {
-      managerDashboard();
-    } else {
-      clientDashboard();
+    if (
+      !name ||
+      !email ||
+      !password ||
+      password.length < 8
+    ) {
+      return res.status(400).json({
+        error:
+          "Name, email and a password of at least 8 characters are required."
+      });
     }
 
-  } catch (error) {
-    message(
-      error.message,
-      "error"
-    );
-  }
-}
+    const normalizedEmail =
+      String(email)
+        .trim()
+        .toLowerCase();
 
-function register() {
-  page(
-    "Create account",
-    `
-    <div class="card auth">
+    const passwordHash =
+      await bcrypt.hash(password, 12);
 
-      <small>CLIENT REGISTRATION</small>
-
-      <h2>
-        Start your demo account
-      </h2>
-
-      <div id="message"></div>
-
-      <form onsubmit="doRegister(event)">
-
-        <label>
-          Name
-          <input id="registerName" required>
-        </label>
-
-        <label>
-          Email
-          <input
-            id="registerEmail"
-            type="email"
-            required
-          >
-        </label>
-
-        <label>
-          Password
-          <input
-            id="registerPassword"
-            type="password"
-            minlength="8"
-            required
-          >
-        </label>
-
-        <button>
-          Create account
-        </button>
-
-      </form>
-
-      <p class="note">
-        Demo only. Do not enter real
-        financial credentials.
-      </p>
-
-    </div>
-    `
-  );
-}
-
-async function doRegister(event) {
-  event.preventDefault();
-
-  try {
-    await api(
-      "/api/register",
-      {
-        method: "POST",
-        body: JSON.stringify({
-          name:
-            document.querySelector(
-              "#registerName"
-            ).value,
-
-          email:
-            document.querySelector(
-              "#registerEmail"
-            ).value,
-
-          password:
-            document.querySelector(
-              "#registerPassword"
-            ).value
-        })
-      }
-    );
-
-    clientDashboard();
-
-  } catch (error) {
-    message(
-      error.message,
-      "error"
-    );
-  }
-}
-
-async function logout() {
-  await api(
-    "/api/logout",
-    {
-      method: "POST"
-    }
-  );
-
-  home();
-}
-
-async function clientDashboard() {
-  try {
-    const data =
-      await api(
-        "/api/client/dashboard"
+    const result = db
+      .prepare(`
+        INSERT INTO users
+          (name, email, password_hash)
+        VALUES
+          (?, ?, ?)
+      `)
+      .run(
+        String(name).trim(),
+        normalizedEmail,
+        passwordHash
       );
 
-    page(
-      "Client dashboard",
-      `
-      <div class="welcome">
-
-        <div>
-          <small>CLIENT SPACE</small>
-
-          <h2>
-            Welcome,
-            ${escapeHTML(data.user.name)}
-          </h2>
-        </div>
-
-        <span class="status active">
-          ${escapeHTML(data.user.status)}
-        </span>
-
-      </div>
-
-      <div class="stats">
-
-        <div>
-          <small>Portfolio value</small>
-
-          <b>
-            ${money(data.total)}
-          </b>
-
-          <em>
-            Fictional demo value
-          </em>
-        </div>
-
-        <div>
-          <small>Holdings</small>
-
-          <b>
-            ${data.holdings.length}
-          </b>
-
-          <em>
-            Demo positions
-          </em>
-        </div>
-
-        <div>
-          <small>Requests</small>
-
-          <b>
-            ${data.requests.length}
-          </b>
-
-          <em>
-            Workflow records
-          </em>
-        </div>
-
-      </div>
-
-      <div class="grid">
-
-        <section class="card">
-
-          <small>PORTFOLIO</small>
-
-          <h2>Holdings</h2>
-
-          <table>
-
-            <tr>
-              <th>Asset</th>
-              <th>Shares</th>
-              <th>Price</th>
-              <th>Value</th>
-            </tr>
-
-            ${data.holdings.map(item => `
-              <tr>
-
-                <td>
-                  <b>
-                    ${escapeHTML(
-                      item.symbol
-                    )}
-                  </b>
-
-                  <small>
-                    ${escapeHTML(
-                      item.name
-                    )}
-                  </small>
-                </td>
-
-                <td>
-                  ${item.shares}
-                </td>
-
-                <td>
-                  ${money(item.price)}
-                </td>
-
-                <td>
-                  ${money(item.value)}
-                </td>
-
-              </tr>
-            `).join("")}
-
-          </table>
-
-        </section>
-
-        <section class="card">
-
-          <small>
-            ACCOUNT WORKFLOW
-          </small>
-
-          <h2>Request</h2>
-
-          <div id="message"></div>
-
-          <label>
-            Type
-
-            <select id="requestType">
-
-              <option value="deposit">
-                Deposit request
-              </option>
-
-              <option value="withdrawal">
-                Withdrawal request
-              </option>
-
-            </select>
-          </label>
-
-          <label>
-            Amount
-
-            <input
-              id="requestAmount"
-              type="number"
-              min="1"
-              step="0.01"
-            >
-          </label>
-
-          <button
-            onclick="requestDemo()"
-          >
-            Submit demo request
-          </button>
-
-          <p class="note">
-            No money moves.
-          </p>
-
-        </section>
-
-      </div>
-
-      <div class="grid">
-
-        <section class="card">
-
-          <small>TRANSACTIONS</small>
-
-          <h2>History</h2>
-
-          ${
-            data.transactions.map(item => `
-              <div class="row">
-
-                <span>
-                  <b>
-                    ${escapeHTML(
-                      item.type
-                    )}
-                  </b>
-
-                  <small>
-                    ${escapeHTML(
-                      item.note || ""
-                    )}
-                  </small>
-                </span>
-
-                <b>
-                  ${money(item.amount)}
-                </b>
-
-              </div>
-            `).join("")
-            ||
-            "<p class='note'>No transactions.</p>"
-          }
-
-        </section>
-
-        <section class="card">
-
-          <small>REQUESTS</small>
-
-          <h2>Requests</h2>
-
-          ${
-            data.requests.map(item => `
-              <div class="row">
-
-                <span>
-                  <b>
-                    ${escapeHTML(
-                      item.type
-                    )}
-                  </b>
-
-                  <small>
-                    #${item.id}
-                  </small>
-                </span>
-
-                <span class="status ${item.status}">
-                  ${escapeHTML(
-                    item.status
-                  )}
-                </span>
-
-              </div>
-            `).join("")
-            ||
-            "<p class='note'>No requests.</p>"
-          }
-
-        </section>
-
-      </div>
-
-      <div class="grid">
-
-        <section class="card">
-
-          <small>NOTIFICATIONS</small>
-
-          <h2>Updates</h2>
-
-          ${data.notifications.map(item => `
-            <div class="noteBox">
-
-              <b>
-                ${escapeHTML(
-                  item.title
-                )}
-              </b>
-
-              <p>
-                ${escapeHTML(
-                  item.body
-                )}
-              </p>
-
-            </div>
-          `).join("")}
-
-        </section>
-
-        <section class="card">
-
-          <small>DOCUMENTS</small>
-
-          <h2>Documents</h2>
-
-          ${data.documents.map(item => `
-            <div class="row">
-
-              <span>
-
-                <b>
-                  ${escapeHTML(
-                    item.title
-                  )}
-                </b>
-
-                <small>
-                  ${escapeHTML(
-                    item.category
-                  )}
-                </small>
-
-              </span>
-
-              <span class="status available">
-                Available
-              </span>
-
-            </div>
-          `).join("")}
-
-        </section>
-
-      </div>
-      `
+    req.session.userId =
+      result.lastInsertRowid;
+
+    const user = currentUser(req);
+
+    db.prepare(`
+      INSERT INTO notifications
+        (user_id, title, body)
+      VALUES
+        (?, ?, ?)
+    `).run(
+      user.id,
+      "Welcome",
+      "Your demonstration account has been created."
     );
 
-  } catch {
-    login();
-  }
-}
-
-async function requestDemo() {
-  try {
-    await api(
-      "/api/client/request",
-      {
-        method: "POST",
-
-        body: JSON.stringify({
-          type:
-            document.querySelector(
-              "#requestType"
-            ).value,
-
-          amount:
-            document.querySelector(
-              "#requestAmount"
-            ).value
-        })
-      }
-    );
-
-    message(
-      "Demo request submitted.",
-      "success"
-    );
-
-    setTimeout(
-      clientDashboard,
-      700
-    );
+    res.json({
+      ok: true,
+      role: user.role
+    });
 
   } catch (error) {
-    message(
-      error.message,
-      "error"
-    );
-  }
-}
+    if (
+      String(error.message)
+        .includes("UNIQUE")
+    ) {
+      return res.status(409).json({
+        error: "An account with that email already exists."
+      });
+    }
 
-async function managerDashboard() {
+    console.error(error);
+
+    res.status(500).json({
+      error: "Registration failed."
+    });
+  }
+});
+
+app.post("/api/login", async (req, res) => {
   try {
-    const data =
-      await api(
-        "/api/manager/overview"
+    const {
+      email,
+      password
+    } = req.body || {};
+
+    const user = db
+      .prepare(`
+        SELECT *
+        FROM users
+        WHERE email = ?
+      `)
+      .get(
+        String(email || "")
+          .trim()
+          .toLowerCase()
       );
 
-    page(
-      "Manager dashboard",
-      `
-      <div class="welcome">
+    if (!user) {
+      return res.status(401).json({
+        error: "Invalid email or password."
+      });
+    }
 
-        <div>
-          <small>
-            MANAGEMENT CONSOLE
-          </small>
+    const valid =
+      await bcrypt.compare(
+        String(password || ""),
+        user.password_hash
+      );
 
-          <h2>
-            Tesla Investment
-          </h2>
-        </div>
+    if (!valid) {
+      return res.status(401).json({
+        error: "Invalid email or password."
+      });
+    }
 
-        <span class="status active">
-          MANAGER
-        </span>
+    if (user.status !== "active") {
+      return res.status(403).json({
+        error: "This account is not active."
+      });
+    }
 
-      </div>
+    req.session.userId = user.id;
 
-      <div class="stats">
+    res.json({
+      ok: true,
+      role: user.role
+    });
 
-        <div>
-          <small>Clients</small>
+  } catch (error) {
+    console.error(error);
 
-          <b>
-            ${data.stats.clients}
-          </b>
+    res.status(500).json({
+      error: "Login failed."
+    });
+  }
+});
 
-          <em>
-            Demo accounts
-          </em>
-        </div>
+app.post(
+  "/api/logout",
+  (req, res) => {
+    req.session.destroy(() => {
+      res.json({ ok: true });
+    });
+  }
+);
 
-        <div>
-          <small>
-            Pending requests
-          </small>
+app.get(
+  "/api/me",
+  requireLogin,
+  (req, res) => {
+    res.json({
+      user: req.user
+    });
+  }
+);
 
-          <b>
-            ${data.stats.pendingRequests}
-          </b>
+app.get(
+  "/api/client/dashboard",
+  requireLogin,
+  (req, res) => {
+    if (req.user.role !== "client") {
+      return res.status(403).json({
+        error: "Client access required."
+      });
+    }
 
-          <em>
-            Awaiting review
-          </em>
-        </div>
+    const holdings = db
+      .prepare(`
+        SELECT
+          id,
+          symbol,
+          name,
+          shares,
+          price,
+          shares * price AS value
+        FROM holdings
+        WHERE user_id = ?
+      `)
+      .all(req.user.id);
 
-        <div>
-          <small>Demo assets</small>
+    const transactions = db
+      .prepare(`
+        SELECT
+          id,
+          type,
+          amount,
+          note,
+          created_at
+        FROM transactions
+        WHERE user_id = ?
+        ORDER BY id DESC
+      `)
+      .all(req.user.id);
 
-          <b>
-            ${money(
-              data.stats.demoAssets
-            )}
-          </b>
+    const requests = db
+      .prepare(`
+        SELECT
+          id,
+          type,
+          amount,
+          status,
+          created_at
+        FROM requests
+        WHERE user_id = ?
+        ORDER BY id DESC
+      `)
+      .all(req.user.id);
 
-          <em>
-            Fictional data
-          </em>
-        </div>
+    const notifications = db
+      .prepare(`
+        SELECT
+          id,
+          title,
+          body,
+          created_at
+        FROM notifications
+        WHERE user_id = ?
+        ORDER BY id DESC
+      `)
+      .all(req.user.id);
 
-      </div>
+    const documents = db
+      .prepare(`
+        SELECT
+          id,
+          title,
+          category
+        FROM documents
+        WHERE user_id = ?
+        ORDER BY id DESC
+      `)
+      .all(req.user.id);
 
-      <section class="card">
-
-        <small>
-          CLIENT MANAGEMENT
-        </small>
-
-        <h2>Accounts</h2>
-
-        <table>
-
-          <tr>
-            <th>Client</th>
-            <th>Email</th>
-            <th>Status</th>
-            <th>Controls</th>
-          </tr>
-
-          ${data.clients.map(client => `
-            <tr>
-
-              <td>
-                <b>
-                  ${escapeHTML(
-                    client.name
-                  )}
-                </b>
-              </td>
-
-              <td>
-                ${escapeHTML(
-                  client.email
-                )}
-              </td>
-
-              <td>
-                <span class="status ${client.status}">
-                  ${escapeHTML(
-                    client.status
-                  )}
-                </span>
-              </td>
-
-              <td>
-
-                <button
-                  class="small"
-                  onclick="setStatus(
-                    ${client.id},
-                    'active'
-                  )"
-                >
-                  Activate
-                </button>
-
-                <button
-                  class="small danger"
-                  onclick="setStatus(
-                    ${client.id},
-                    'suspended'
-                  )"
-                >
-                  Suspend
-                </button>
-
-              </td>
-
-            </tr>
-          `).join("")}
-
-        </table>
-
-      </section>
-
-      <section class="card">
-
-        <small>
-          WORKFLOW REVIEW
-        </small>
-
-        <h2>Requests</h2>
-
-        <table>
-
-          <tr>
-            <th>Client</th>
-            <th>Type</th>
-            <th>Amount</th>
-            <th>Status</th>
-            <th>Action</th>
-          </tr>
-
-          ${data.requests.map(request => `
-            <tr>
-
-              <td>
-                <b>
-                  ${escapeHTML(
-                    request.name
-                  )}
-                </b>
-
-                <small>
-                  ${escapeHTML(
-                    request.email
-                  )}
-                </small>
-              </td>
-
-              <td>
-                ${escapeHTML(
-                  request.type
-                )}
-              </td>
-
-              <td>
-                ${money(
-                  request.amount
-                )}
-              </td>
-
-              <td>
-                <span class="status ${request.status}">
-                  ${escapeHTML(
-                    request.status
-                  )}
-                </span>
-              </td>
-
-              <td>
-
-                ${
-                  request.status === "pending"
-                  ?
-                  `
-                  <button
-                    class="small"
-                    onclick="requestStatus(
-                      ${request.id},
-                      'approved'
-                    )"
-                  >
-                    Approve
-                  </button>
-
-                  <button
-                    class="small danger"
-                    onclick="requestStatus(
-                      ${request.id},
-                      'rejected'
-                    )"
-                  >
-                    Reject
-                  </button>
-                  `
-                  :
-                  "Done"
-                }
-
-              </td>
-
-            </tr>
-          `).join("")}
-
-        </table>
-
-        <p class="note">
-          All actions affect fictional
-          prototype records only.
-        </p>
-
-      </section>
-      `
+    const total = holdings.reduce(
+      (sum, item) =>
+        sum + Number(item.value),
+      0
     );
 
-  } catch {
-    login();
+    res.json({
+      user: req.user,
+      holdings,
+      transactions,
+      requests,
+      notifications,
+      documents,
+      total
+    });
   }
-}
+);
 
-async function setStatus(id, status) {
-  await api(
-    `/api/manager/user/${id}/status`,
-    {
-      method: "POST",
-      body: JSON.stringify({ status })
+app.post(
+  "/api/client/request",
+  requireLogin,
+  (req, res) => {
+    if (req.user.role !== "client") {
+      return res.status(403).json({
+        error: "Client access required."
+      });
     }
-  );
 
-  managerDashboard();
-}
+    const {
+      type,
+      amount
+    } = req.body || {};
 
-async function requestStatus(id, status) {
-  await api(
-    `/api/manager/request/${id}`,
-    {
-      method: "POST",
-      body: JSON.stringify({ status })
+    const allowed = [
+      "deposit",
+      "withdrawal"
+    ];
+
+    const numericAmount =
+      Number(amount);
+
+    if (
+      !allowed.includes(type) ||
+      !Number.isFinite(numericAmount) ||
+      numericAmount <= 0
+    ) {
+      return res.status(400).json({
+        error: "Enter a valid request type and amount."
+      });
     }
-  );
 
-  managerDashboard();
-}
+    db.prepare(`
+      INSERT INTO requests
+        (user_id, type, amount)
+      VALUES
+        (?, ?, ?)
+    `).run(
+      req.user.id,
+      type,
+      numericAmount
+    );
 
-home();
+    db.prepare(`
+      INSERT INTO notifications
+        (user_id, title, body)
+      VALUES
+        (?, ?, ?)
+    `).run(
+      req.user.id,
+      "Request received",
+      `Your ${type} request was recorded for review.`
+    );
+
+    res.json({
+      ok: true
+    });
+  }
+);
+
+app.get(
+  "/api/manager/overview",
+  requireLogin,
+  requireManager,
+  (req, res) => {
+    const clients = db
+      .prepare(`
+        SELECT
+          id,
+          name,
+          email,
+          status,
+          created_at
+        FROM users
+        WHERE role = 'client'
+        ORDER BY id DESC
+      `)
+      .all();
+
+    const requests = db
+      .prepare(`
+        SELECT
+          requests.id,
+          requests.type,
+          requests.amount,
+          requests.status,
+          requests.created_at,
+          users.name,
+          users.email
+        FROM requests
+        JOIN users
+          ON users.id = requests.user_id
+        ORDER BY requests.id DESC
+      `)
+      .all();
+
+    const pending =
+      requests.filter(
+        item => item.status === "pending"
+      ).length;
+
+    const demoAssets =
+      db.prepare(`
+        SELECT
+          COALESCE(
+            SUM(shares * price),
+            0
+          ) AS total
+        FROM holdings
+      `).get().total;
+
+    res.json({
+      clients,
+      requests,
+      stats: {
+        clients: clients.length,
+        pendingRequests: pending,
+        demoAssets
+      }
+    });
+  }
+);
+
+app.post(
+  "/api/manager/user/:id/status",
+  requireLogin,
+  requireManager,
+  (req, res) => {
+    const status =
+      req.body?.status;
+
+    if (
+      ![
+        "active",
+        "suspended"
+      ].includes(status)
+    ) {
+      return res.status(400).json({
+        error: "Invalid status."
+      });
+    }
+
+    db.prepare(`
+      UPDATE users
+      SET status = ?
+      WHERE id = ?
+        AND role = 'client'
+    `).run(
+      status,
+      req.params.id
+    );
+
+    res.json({
+      ok: true
+    });
+  }
+);
+
+app.post(
+  "/api/manager/request/:id",
+  requireLogin,
+  requireManager,
+  (req, res) => {
+    const status =
+      req.body?.status;
+
+    if (
+      ![
+        "approved",
+        "rejected"
+      ].includes(status)
+    ) {
+      return res.status(400).json({
+        error: "Invalid request status."
+      });
+    }
+
+    const request = db
+      .prepare(`
+        SELECT *
+        FROM requests
+        WHERE id = ?
+      `)
+      .get(req.params.id);
+
+    if (!request) {
+      return res.status(404).json({
+        error: "Request not found."
+      });
+    }
+
+    db.prepare(`
+      UPDATE requests
+      SET status = ?
+      WHERE id = ?
+    `).run(
+      status,
+      req.params.id
+    );
+
+    db.prepare(`
+      INSERT INTO notifications
+        (user_id, title, body)
+      VALUES
+        (?, ?, ?)
+    `).run(
+      request.user_id,
+      "Request updated",
+      `Your ${request.type} request is now ${status}.`
+    );
+
+    res.json({
+      ok: true
+    });
+  }
+);
+
+app.get(
+  "/health",
+  (req, res) => {
+    res.json({
+      ok: true,
+      service: "Tesla Investment prototype"
+    });
+  }
+);
+
+app.get(
+  "*",
+  (req, res) => {
+    res.sendFile(
+      path.join(
+        __dirname,
+        "public",
+        "index.html"
+      )
+    );
+  }
+);
+
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `Tesla Investment prototype running on port ${PORT}`
+    );
+  }
+);
